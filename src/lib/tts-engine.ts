@@ -11,17 +11,89 @@ export interface VoiceOption {
   id: string;
   name: string;
   lang: string;
-  quality: "high" | "medium" | "low";
-  online: boolean;
-  nativeVoice: SpeechSynthesisVoice;
+  quality: "ai" | "high" | "medium" | "low";
+  engine: "kokoro" | "browser";
+  /** Kokoro voice ID (e.g. pf_dora) */
+  kokoroVoiceId?: string;
+  /** Browser native voice */
+  nativeVoice?: SpeechSynthesisVoice;
+  online?: boolean;
 }
 
 type TTSCallback = (state: TTSState) => void;
 
-/**
- * Splits text into speakable chunks at natural sentence boundaries.
- * Keeps chunks shorter for more responsive playback and natural pauses.
- */
+// Lazy-loaded Kokoro instance
+let kokoroInstance: KokoroTTSInstance | null = null;
+let kokoroLoading = false;
+let kokoroError = false;
+
+interface KokoroTTSInstance {
+  generate: (
+    text: string,
+    options: { voice: string },
+  ) => Promise<{ toBlob: () => Blob }>;
+}
+
+async function getKokoro(): Promise<KokoroTTSInstance | null> {
+  if (kokoroInstance) return kokoroInstance;
+  if (kokoroError) return null;
+  if (kokoroLoading) {
+    // Wait for existing load
+    return new Promise((resolve) => {
+      const check = setInterval(() => {
+        if (kokoroInstance || kokoroError) {
+          clearInterval(check);
+          resolve(kokoroInstance);
+        }
+      }, 200);
+    });
+  }
+
+  kokoroLoading = true;
+  try {
+    const { KokoroTTS } = await import("kokoro-js");
+    kokoroInstance = (await KokoroTTS.from_pretrained(
+      "onnx-community/Kokoro-82M-ONNX",
+      { dtype: "q8" },
+    )) as unknown as KokoroTTSInstance;
+    return kokoroInstance;
+  } catch (err) {
+    console.error("Failed to load Kokoro TTS:", err);
+    kokoroError = true;
+    return null;
+  } finally {
+    kokoroLoading = false;
+  }
+}
+
+/** Kokoro pt-BR voices */
+const KOKORO_VOICES: VoiceOption[] = [
+  {
+    id: "kokoro-pf_dora",
+    name: "Dora (IA Neural)",
+    lang: "pt-BR",
+    quality: "ai",
+    engine: "kokoro",
+    kokoroVoiceId: "pf_dora",
+  },
+  {
+    id: "kokoro-pm_alex",
+    name: "Alex (IA Neural)",
+    lang: "pt-BR",
+    quality: "ai",
+    engine: "kokoro",
+    kokoroVoiceId: "pm_alex",
+  },
+  {
+    id: "kokoro-pm_santa",
+    name: "Santa (IA Neural)",
+    lang: "pt-BR",
+    quality: "ai",
+    engine: "kokoro",
+    kokoroVoiceId: "pm_santa",
+  },
+];
+
 function splitIntoChunks(text: string, maxLen = 200): string[] {
   const chunks: string[] = [];
   const sentences = text.split(/(?<=[.!?;:\n])\s+/);
@@ -42,46 +114,31 @@ function splitIntoChunks(text: string, maxLen = 200): string[] {
   return chunks.length > 0 ? chunks : [text];
 }
 
-/**
- * Score voices by quality for Portuguese reading.
- * Higher = better quality.
- */
-function scoreVoice(voice: SpeechSynthesisVoice): number {
+function scoreBrowserVoice(voice: SpeechSynthesisVoice): number {
   const name = voice.name.toLowerCase();
   let score = 0;
 
-  // Language match
   if (voice.lang === "pt-BR") score += 200;
   else if (voice.lang.startsWith("pt")) score += 100;
-  else return -1000; // Deprioritize non-Portuguese
+  else return -1000;
 
-  // Online/cloud voices are much better quality
   if (!voice.localService) score += 80;
-
-  // Google voices (Chrome) — best quality online TTS
   if (name.includes("google")) score += 60;
-
-  // Microsoft Online voices — good quality
   if (name.includes("microsoft") && !voice.localService) score += 50;
   if (name.includes("microsoft") && voice.localService) score += 20;
-
-  // Specific high-quality voices
-  if (name.includes("fernanda")) score += 30;
-  if (name.includes("francisca")) score += 30;
+  if (name.includes("fernanda") || name.includes("francisca")) score += 30;
   if (name.includes("maria")) score += 25;
-  if (name.includes("daniel")) score += 15;
-
-  // Avoid low-quality engines
   if (name.includes("espeak")) score -= 100;
   if (name.includes("compact")) score -= 80;
-  if (name.includes("mbrola")) score -= 60;
 
   return score;
 }
 
-function getQualityLevel(voice: SpeechSynthesisVoice): "high" | "medium" | "low" {
+function getBrowserQuality(
+  voice: SpeechSynthesisVoice,
+): "high" | "medium" | "low" {
   const name = voice.name.toLowerCase();
-  if (!voice.localService) return "high"; // Online = high quality
+  if (!voice.localService) return "high";
   if (name.includes("espeak") || name.includes("compact")) return "low";
   return "medium";
 }
@@ -96,6 +153,10 @@ export class TTSEngine {
   private _rate = 1;
   private _pitch = 1;
   private _selectedVoice: VoiceOption | null = null;
+  private _currentAudio: HTMLAudioElement | null = null;
+  private _aborted = false;
+  private _kokoroReady = false;
+  private _kokoroLoadProgress: ((loading: boolean) => void) | null = null;
 
   constructor() {
     this.synth = window.speechSynthesis;
@@ -116,6 +177,10 @@ export class TTSEngine {
 
   onStateChange(cb: TTSCallback): void {
     this.callback = cb;
+  }
+
+  onKokoroLoadProgress(cb: (loading: boolean) => void): void {
+    this._kokoroLoadProgress = cb;
   }
 
   private emitState(): void {
@@ -139,26 +204,40 @@ export class TTSEngine {
 
   setVoice(voice: VoiceOption): void {
     this._selectedVoice = voice;
+
+    // Pre-load Kokoro when an AI voice is selected
+    if (voice.engine === "kokoro" && !this._kokoroReady) {
+      this._kokoroLoadProgress?.(true);
+      getKokoro().then((k) => {
+        this._kokoroReady = !!k;
+        this._kokoroLoadProgress?.(false);
+      });
+    }
   }
 
-  /** Get all available voices, ranked by quality */
   getVoices(): VoiceOption[] {
-    const allVoices = this.synth.getVoices();
+    const voices: VoiceOption[] = [...KOKORO_VOICES];
 
-    return allVoices
+    const allBrowserVoices = this.synth.getVoices();
+    const ptBrowserVoices = allBrowserVoices
       .filter((v) => v.lang.startsWith("pt"))
-      .sort((a, b) => scoreVoice(b) - scoreVoice(a))
-      .map((v) => ({
-        id: `${v.name}-${v.lang}`,
-        name: v.name,
-        lang: v.lang,
-        quality: getQualityLevel(v),
-        online: !v.localService,
-        nativeVoice: v,
-      }));
+      .sort((a, b) => scoreBrowserVoice(b) - scoreBrowserVoice(a))
+      .map(
+        (v): VoiceOption => ({
+          id: `browser-${v.name}`,
+          name: v.name,
+          lang: v.lang,
+          quality: getBrowserQuality(v),
+          engine: "browser",
+          nativeVoice: v,
+          online: !v.localService,
+        }),
+      );
+
+    voices.push(...ptBrowserVoices);
+    return voices;
   }
 
-  /** Get best available voice */
   getBestVoice(): VoiceOption | null {
     const voices = this.getVoices();
     return voices.length > 0 ? voices[0] : null;
@@ -172,7 +251,15 @@ export class TTSEngine {
   }
 
   play(): void {
-    if (this._isPaused) {
+    if (this._isPaused && this._currentAudio) {
+      this._currentAudio.play();
+      this._isPaused = false;
+      this._isPlaying = true;
+      this.emitState();
+      return;
+    }
+
+    if (this._isPaused && this._selectedVoice?.engine === "browser") {
       this.synth.resume();
       this._isPaused = false;
       this._isPlaying = true;
@@ -185,18 +272,30 @@ export class TTSEngine {
 
     this._isPlaying = true;
     this._isPaused = false;
+    this._aborted = false;
     this.speakChunk(this.currentIndex);
   }
 
   pause(): void {
     if (!this._isPlaying) return;
-    this.synth.pause();
+
+    if (this._currentAudio) {
+      this._currentAudio.pause();
+    } else {
+      this.synth.pause();
+    }
+
     this._isPaused = true;
     this._isPlaying = false;
     this.emitState();
   }
 
   stop(): void {
+    this._aborted = true;
+    if (this._currentAudio) {
+      this._currentAudio.pause();
+      this._currentAudio = null;
+    }
     this.synth.cancel();
     this._isPlaying = false;
     this._isPaused = false;
@@ -205,37 +304,37 @@ export class TTSEngine {
   }
 
   next(): void {
-    if (this.currentIndex < this.chunks.length - 1) {
-      this.synth.cancel();
-      this.currentIndex++;
-      if (this._isPlaying || this._isPaused) {
-        this._isPaused = false;
-        this._isPlaying = true;
-        this.speakChunk(this.currentIndex);
-      } else {
-        this.emitState();
-      }
-    }
+    if (this.currentIndex >= this.chunks.length - 1) return;
+    this._abortCurrent();
+    this.currentIndex++;
+    this._resumeIfPlaying();
   }
 
   previous(): void {
-    if (this.currentIndex > 0) {
-      this.synth.cancel();
-      this.currentIndex--;
-      if (this._isPlaying || this._isPaused) {
-        this._isPaused = false;
-        this._isPlaying = true;
-        this.speakChunk(this.currentIndex);
-      } else {
-        this.emitState();
-      }
-    }
+    if (this.currentIndex <= 0) return;
+    this._abortCurrent();
+    this.currentIndex--;
+    this._resumeIfPlaying();
   }
 
   seekTo(percent: number): void {
     const index = Math.floor((percent / 100) * (this.chunks.length - 1));
-    this.synth.cancel();
+    this._abortCurrent();
     this.currentIndex = Math.max(0, Math.min(index, this.chunks.length - 1));
+    this._resumeIfPlaying();
+  }
+
+  private _abortCurrent(): void {
+    this._aborted = true;
+    if (this._currentAudio) {
+      this._currentAudio.pause();
+      this._currentAudio = null;
+    }
+    this.synth.cancel();
+    this._aborted = false;
+  }
+
+  private _resumeIfPlaying(): void {
     if (this._isPlaying || this._isPaused) {
       this._isPaused = false;
       this._isPlaying = true;
@@ -254,48 +353,104 @@ export class TTSEngine {
       return;
     }
 
-    const utterance = new SpeechSynthesisUtterance(this.chunks[index]);
-    utterance.rate = this._rate;
-    utterance.pitch = this._pitch;
-    utterance.lang = "pt-BR";
+    this.currentIndex = index;
+    this.emitState();
 
-    if (this._selectedVoice) {
-      utterance.voice = this._selectedVoice.nativeVoice;
+    if (this._selectedVoice?.engine === "kokoro") {
+      this.speakWithKokoro(index);
+    } else {
+      this.speakWithBrowser(index);
     }
+  }
 
-    utterance.onend = () => {
-      if (!this._isPaused) {
+  private async speakWithKokoro(index: number): Promise<void> {
+    const text = this.chunks[index];
+    const voiceId = this._selectedVoice?.kokoroVoiceId ?? "pf_dora";
+
+    try {
+      const kokoro = await getKokoro();
+      if (!kokoro || this._aborted) return;
+
+      const result = await kokoro.generate(text, { voice: voiceId });
+      if (this._aborted) return;
+
+      const blob = result.toBlob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.playbackRate = this._rate;
+      this._currentAudio = audio;
+
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        this._currentAudio = null;
+        if (this._aborted) return;
+
         this.currentIndex = index + 1;
         if (this.currentIndex < this.chunks.length) {
-          // Natural pause between chunks
-          setTimeout(() => {
-            if (this._isPlaying && !this._isPaused) {
-              this.speakChunk(this.currentIndex);
-            }
-          }, 120);
+          this.speakChunk(this.currentIndex);
         } else {
           this._isPlaying = false;
           this.currentIndex = 0;
           this.emitState();
         }
+      };
+
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        if (this._aborted) return;
+        console.warn("Kokoro audio error, trying browser TTS");
+        this.speakWithBrowser(index);
+      };
+
+      await audio.play();
+    } catch (err) {
+      if (this._aborted) return;
+      console.warn("Kokoro TTS failed:", err);
+      this.speakWithBrowser(index);
+    }
+  }
+
+  private speakWithBrowser(index: number): void {
+    const text = this.chunks[index];
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = this._rate;
+    utterance.pitch = this._pitch;
+    utterance.lang = "pt-BR";
+
+    if (this._selectedVoice?.nativeVoice) {
+      utterance.voice = this._selectedVoice.nativeVoice;
+    }
+
+    utterance.onend = () => {
+      if (this._aborted) return;
+      this.currentIndex = index + 1;
+      if (this.currentIndex < this.chunks.length) {
+        setTimeout(() => {
+          if (this._isPlaying && !this._isPaused && !this._aborted) {
+            this.speakChunk(this.currentIndex);
+          }
+        }, 100);
+      } else {
+        this._isPlaying = false;
+        this.currentIndex = 0;
+        this.emitState();
       }
     };
 
     utterance.onerror = (event) => {
       if (event.error !== "interrupted" && event.error !== "canceled") {
-        console.error("TTS error:", event.error);
+        console.error("Browser TTS error:", event.error);
         this._isPlaying = false;
         this.emitState();
       }
     };
 
-    this.currentIndex = index;
-    this.emitState();
     this.synth.speak(utterance);
   }
 
   destroy(): void {
     this.stop();
     this.callback = null;
+    this._kokoroLoadProgress = null;
   }
 }

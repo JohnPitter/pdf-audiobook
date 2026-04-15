@@ -11,8 +11,9 @@ interface AudioPlayerProps {
 }
 
 const QUALITY_BADGE: Record<string, { label: string; cls: string }> = {
-  high: { label: "Alta qualidade", cls: "bg-emerald-100 text-emerald-600" },
-  medium: { label: "Boa", cls: "bg-blue-100 text-blue-600" },
+  ai: { label: "IA Neural", cls: "bg-purple-100 text-purple-600" },
+  high: { label: "Online", cls: "bg-emerald-100 text-emerald-600" },
+  medium: { label: "Local", cls: "bg-blue-100 text-blue-600" },
   low: { label: "Basica", cls: "bg-stone-100 text-stone-500" },
 };
 
@@ -38,11 +39,13 @@ export function AudioPlayer({
   const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [selectedVoiceIdx, setSelectedVoiceIdx] = useState(-1);
   const [showSettings, setShowSettings] = useState(false);
+  const [kokoroLoading, setKokoroLoading] = useState(false);
 
   useEffect(() => {
     const engine = new TTSEngine();
     engineRef.current = engine;
     engine.onStateChange(setTtsState);
+    engine.onKokoroLoadProgress(setKokoroLoading);
     engine.loadText(text);
 
     const loadVoices = () => {
@@ -166,11 +169,17 @@ export function AudioPlayer({
           <span
             className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider ${QUALITY_BADGE[selectedVoice.quality].cls}`}
           >
-            {selectedVoice.online ? "Online" : QUALITY_BADGE[selectedVoice.quality].label}
+            {QUALITY_BADGE[selectedVoice.quality].label}
           </span>
           <span className="text-[11px] text-stone-400">
             {selectedVoice.name}
           </span>
+          {kokoroLoading && (
+            <span className="flex items-center gap-1.5 text-[10px] text-purple-400">
+              <span className="w-2.5 h-2.5 border-2 border-purple-200 border-t-purple-500 rounded-full animate-spin" />
+              Carregando modelo IA (~86MB)...
+            </span>
+          )}
         </div>
       )}
 
@@ -321,41 +330,83 @@ export function AudioPlayer({
 
             {/* Voice selector */}
             {voices.length > 0 && (
-              <div className="space-y-2">
+              <div className="space-y-3">
                 <label className="text-[11px] font-medium text-stone-500 uppercase tracking-wider">
                   Voz
                 </label>
-                <div className="space-y-1">
-                  {voices.map((voice, idx) => {
-                    const isSelected = idx === selectedVoiceIdx;
-                    const badge = QUALITY_BADGE[voice.quality];
-                    return (
-                      <button
-                        key={voice.id}
-                        onClick={() => handleVoiceChange(idx)}
-                        className={`w-full px-3 py-2 rounded-lg text-left transition-all duration-150 flex items-center justify-between ${
-                          isSelected
-                            ? "bg-orange-50 border-2 border-orange-300"
-                            : "bg-stone-50/50 border-2 border-transparent hover:bg-stone-50"
-                        }`}
-                      >
-                        <div className="min-w-0">
-                          <p className={`text-[12px] font-medium truncate ${isSelected ? "text-orange-700" : "text-stone-600"}`}>
-                            {voice.name}
-                          </p>
-                          <p className="text-[10px] text-stone-400">{voice.lang}</p>
-                        </div>
-                        <span className={`shrink-0 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider ${badge.cls}`}>
-                          {voice.online ? "Online" : badge.label}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-                <p className="text-[10px] text-stone-300">
-                  Vozes online (Google/Microsoft) tem qualidade superior.
-                  Use o Chrome para mais opcoes.
-                </p>
+
+                {/* AI voices (Kokoro) */}
+                {voices.some((v) => v.engine === "kokoro") && (
+                  <div className="space-y-1.5">
+                    <p className="text-[10px] font-semibold text-purple-500 uppercase tracking-wider flex items-center gap-1.5">
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+                      </svg>
+                      Vozes IA (voz natural)
+                    </p>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {voices.filter((v) => v.engine === "kokoro").map((voice, _i) => {
+                        const globalIdx = voices.indexOf(voice);
+                        const isSelected = globalIdx === selectedVoiceIdx;
+                        return (
+                          <button
+                            key={voice.id}
+                            onClick={() => handleVoiceChange(globalIdx)}
+                            className={`px-3 py-2.5 rounded-lg text-center transition-all duration-150 ${
+                              isSelected
+                                ? "bg-purple-50 border-2 border-purple-300 shadow-sm"
+                                : "bg-stone-50 border-2 border-transparent hover:bg-purple-50/50"
+                            }`}
+                          >
+                            <p className={`text-[12px] font-semibold ${isSelected ? "text-purple-700" : "text-stone-600"}`}>
+                              {voice.kokoroVoiceId === "pf_dora" ? "Dora" : voice.kokoroVoiceId === "pm_alex" ? "Alex" : "Santa"}
+                            </p>
+                            <p className="text-[9px] text-stone-400 mt-0.5">
+                              {voice.kokoroVoiceId?.startsWith("pf") ? "Feminina" : "Masculino"}
+                            </p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-purple-300">
+                      Modelo Kokoro 82M — download unico de ~86MB, roda local no navegador
+                    </p>
+                  </div>
+                )}
+
+                {/* Browser voices */}
+                {voices.some((v) => v.engine === "browser") && (
+                  <div className="space-y-1.5">
+                    <p className="text-[10px] font-semibold text-stone-400 uppercase tracking-wider">
+                      Vozes do navegador
+                    </p>
+                    <div className="space-y-1 max-h-32 overflow-y-auto">
+                      {voices.filter((v) => v.engine === "browser").map((voice) => {
+                        const globalIdx = voices.indexOf(voice);
+                        const isSelected = globalIdx === selectedVoiceIdx;
+                        const badge = QUALITY_BADGE[voice.quality];
+                        return (
+                          <button
+                            key={voice.id}
+                            onClick={() => handleVoiceChange(globalIdx)}
+                            className={`w-full px-3 py-1.5 rounded-lg text-left transition-all duration-150 flex items-center justify-between ${
+                              isSelected
+                                ? "bg-orange-50 border-2 border-orange-300"
+                                : "bg-stone-50/50 border-2 border-transparent hover:bg-stone-50"
+                            }`}
+                          >
+                            <p className={`text-[11px] truncate ${isSelected ? "text-orange-700 font-medium" : "text-stone-500"}`}>
+                              {voice.name}
+                            </p>
+                            <span className={`shrink-0 px-1.5 py-0.5 rounded text-[8px] font-bold uppercase tracking-wider ${badge.cls}`}>
+                              {badge.label}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
