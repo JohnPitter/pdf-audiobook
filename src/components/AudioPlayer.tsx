@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { TTSEngine, type TTSState } from "../lib/tts-engine";
+import { TTSEngine, type TTSState, type VoiceOption } from "../lib/tts-engine";
 
 interface AudioPlayerProps {
   text: string;
@@ -9,6 +9,20 @@ interface AudioPlayerProps {
   onReset: () => void;
   mode: "highlights" | "full";
 }
+
+const QUALITY_LABELS: Record<string, string> = {
+  generative: "AI Generativa",
+  neural: "Neural",
+  standard: "Standard",
+  local: "Local",
+};
+
+const QUALITY_COLORS: Record<string, string> = {
+  generative: "bg-purple-100 text-purple-600",
+  neural: "bg-emerald-100 text-emerald-600",
+  standard: "bg-blue-100 text-blue-600",
+  local: "bg-stone-100 text-stone-500",
+};
 
 export function AudioPlayer({
   text,
@@ -28,31 +42,45 @@ export function AudioPlayer({
     currentText: "",
   });
   const [rate, setRate] = useState(1);
-  const [pitch, setPitch] = useState(1);
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [selectedVoiceIdx, setSelectedVoiceIdx] = useState(-1);
   const [showSettings, setShowSettings] = useState(false);
+  const [puterLoading, setPuterLoading] = useState(true);
 
   useEffect(() => {
     const engine = new TTSEngine();
     engineRef.current = engine;
     engine.onStateChange(setTtsState);
-    engine.loadText(text);
 
-    const loadVoices = () => {
+    const init = async () => {
+      // Load Puter.js for AI voices
+      await engine.initPuter();
+      setPuterLoading(false);
+
+      // Load voices
       const available = engine.getVoices();
       setVoices(available);
 
-      if (available.length > 0 && selectedVoiceIdx === -1) {
+      if (available.length > 0) {
         const best = engine.getBestVoice();
         const idx = best ? available.indexOf(best) : 0;
-        setSelectedVoiceIdx(idx >= 0 ? idx : 0);
-        engine.setVoice(available[idx >= 0 ? idx : 0]);
+        const finalIdx = idx >= 0 ? idx : 0;
+        setSelectedVoiceIdx(finalIdx);
+        engine.setVoice(available[finalIdx]);
       }
+
+      engine.loadText(text);
     };
 
-    loadVoices();
-    speechSynthesis.onvoiceschanged = loadVoices;
+    init();
+
+    // Also listen for browser voices loading
+    const onVoicesChanged = () => {
+      if (!engineRef.current) return;
+      const available = engineRef.current.getVoices();
+      setVoices(available);
+    };
+    speechSynthesis.onvoiceschanged = onVoicesChanged;
 
     return () => {
       engine.destroy();
@@ -77,19 +105,16 @@ export function AudioPlayer({
     engineRef.current?.setRate(newRate);
   }, []);
 
-  const handlePitchChange = useCallback((newPitch: number) => {
-    setPitch(newPitch);
-    engineRef.current?.setPitch(newPitch);
-  }, []);
-
   const handleVoiceChange = useCallback(
     (idx: number) => {
       setSelectedVoiceIdx(idx);
       if (voices[idx]) {
         engineRef.current?.setVoice(voices[idx]);
+        // Reload text with appropriate chunk size
+        engineRef.current?.loadText(text);
       }
     },
-    [voices],
+    [voices, text],
   );
 
   const handleSeek = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -103,6 +128,8 @@ export function AudioPlayer({
     () => Math.ceil(wordCount / (150 * rate)),
     [wordCount, rate],
   );
+
+  const selectedVoice = voices[selectedVoiceIdx];
 
   return (
     <div className="w-full max-w-2xl mx-auto space-y-5 animate-fade-in">
@@ -151,24 +178,38 @@ export function AudioPlayer({
         ))}
       </div>
 
+      {/* Voice badge */}
+      {selectedVoice && (
+        <div className="flex items-center gap-2 px-1">
+          <span
+            className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider ${QUALITY_COLORS[selectedVoice.quality]}`}
+          >
+            {QUALITY_LABELS[selectedVoice.quality]}
+          </span>
+          <span className="text-[11px] text-stone-400">
+            {selectedVoice.name}
+          </span>
+          {selectedVoice.engine === "puter" && (
+            <span className="text-[10px] text-stone-300">
+              via AWS Polly
+            </span>
+          )}
+        </div>
+      )}
+
       {/* Main player card */}
       <div className="rounded-2xl bg-white border border-stone-100 shadow-sm overflow-hidden">
         {/* Now playing text */}
         <div className="relative px-6 pt-6 pb-5 min-h-[110px] flex items-center justify-center">
-          {/* Background gradient */}
           <div className="absolute inset-0 bg-gradient-to-b from-orange-50/60 via-amber-50/30 to-transparent" />
 
-          {/* Waveform animation when playing */}
           {ttsState.isPlaying && (
             <div className="absolute bottom-3 left-6 flex items-end gap-[3px]">
               {[0, 1, 2, 3, 4].map((i) => (
                 <div
                   key={i}
                   className="w-[3px] bg-orange-300 rounded-full animate-waveform"
-                  style={{
-                    animationDelay: `${i * 0.15}s`,
-                    height: "4px",
-                  }}
+                  style={{ animationDelay: `${i * 0.15}s`, height: "4px" }}
                 />
               ))}
             </div>
@@ -177,7 +218,9 @@ export function AudioPlayer({
           <p className="relative text-stone-600 text-center text-[14px] leading-relaxed max-w-md">
             {ttsState.currentText || (
               <span className="text-stone-300 italic text-[13px]">
-                Pressione play para iniciar a leitura...
+                {puterLoading
+                  ? "Carregando vozes de alta qualidade..."
+                  : "Pressione play para iniciar a leitura..."}
               </span>
             )}
           </p>
@@ -206,7 +249,7 @@ export function AudioPlayer({
 
         {/* Transport controls */}
         <div className="px-6 py-4 flex items-center justify-center gap-3">
-          <ControlButton onClick={handlePrev} title="Anterior" size="sm">
+          <ControlButton onClick={handlePrev} title="Anterior">
             <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
               <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" />
             </svg>
@@ -214,9 +257,9 @@ export function AudioPlayer({
 
           <button
             onClick={handlePlayPause}
-            className="relative w-14 h-14 rounded-full bg-gradient-to-b from-orange-500 to-orange-600 text-white flex items-center justify-center transition-all shadow-lg shadow-orange-200/60 hover:shadow-xl hover:shadow-orange-200/80 active:scale-95 active:shadow-md"
+            disabled={puterLoading && voices.length === 0}
+            className="relative w-14 h-14 rounded-full bg-gradient-to-b from-orange-500 to-orange-600 text-white flex items-center justify-center transition-all shadow-lg shadow-orange-200/60 hover:shadow-xl hover:shadow-orange-200/80 active:scale-95 active:shadow-md disabled:opacity-50"
           >
-            {/* Pulse ring when playing */}
             {ttsState.isPlaying && (
               <div className="absolute inset-0 rounded-full bg-orange-400 animate-pulse-ring" />
             )}
@@ -231,23 +274,21 @@ export function AudioPlayer({
             )}
           </button>
 
-          <ControlButton onClick={handleNext} title="Proximo" size="sm">
+          <ControlButton onClick={handleNext} title="Proximo">
             <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
               <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />
             </svg>
           </ControlButton>
 
-          <ControlButton onClick={handleStop} title="Parar" size="sm">
+          <ControlButton onClick={handleStop} title="Parar">
             <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
               <path d="M6 6h12v12H6z" />
             </svg>
           </ControlButton>
 
-          {/* Settings toggle */}
           <ControlButton
             onClick={() => setShowSettings((s) => !s)}
             title="Configuracoes"
-            size="sm"
             active={showSettings}
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
@@ -256,7 +297,7 @@ export function AudioPlayer({
           </ControlButton>
         </div>
 
-        {/* Speed pills (always visible) */}
+        {/* Speed pills */}
         <div className="px-6 pb-4">
           <div className="flex gap-1.5">
             {[0.5, 0.75, 1, 1.25, 1.5, 2].map((r) => (
@@ -275,56 +316,81 @@ export function AudioPlayer({
           </div>
         </div>
 
-        {/* Settings panel (expandable) */}
+        {/* Settings panel */}
         {showSettings && (
           <div className="px-6 pb-5 space-y-4 border-t border-stone-50 pt-4 animate-slide-up">
-            {/* Pitch */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium text-stone-500 uppercase tracking-wider">
-                  Tom da voz
-                </label>
-                <span className="text-[11px] font-bold text-orange-500 tabular-nums">
-                  {pitch.toFixed(1)}
-                </span>
-              </div>
-              <input
-                type="range"
-                min="0.5"
-                max="1.5"
-                step="0.1"
-                value={pitch}
-                onChange={(e) => handlePitchChange(Number(e.target.value))}
-                className="w-full h-1.5 bg-stone-100 rounded-full appearance-none cursor-pointer accent-orange-500"
-              />
-              <div className="flex justify-between text-[9px] text-stone-300">
-                <span>Grave</span>
-                <span>Normal</span>
-                <span>Agudo</span>
-              </div>
-            </div>
-
             {/* Voice selector */}
             {voices.length > 0 && (
-              <div className="space-y-2">
+              <div className="space-y-3">
                 <label className="text-[11px] font-medium text-stone-500 uppercase tracking-wider">
                   Voz
                 </label>
-                <select
-                  value={selectedVoiceIdx}
-                  onChange={(e) => handleVoiceChange(Number(e.target.value))}
-                  className="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2.5 text-[13px] text-stone-700 focus:outline-none focus:ring-2 focus:ring-orange-200 focus:border-orange-300 transition-all"
-                >
-                  {voices.map((voice, idx) => (
-                    <option key={`${voice.name}-${idx}`} value={idx}>
-                      {voice.name} ({voice.lang})
-                      {!voice.localService ? " — Online" : ""}
-                    </option>
-                  ))}
-                </select>
-                <p className="text-[10px] text-stone-300">
-                  Vozes online tem qualidade superior quando disponiveis
-                </p>
+
+                {/* AI voices (Puter) */}
+                {voices.some((v) => v.engine === "puter") && (
+                  <div className="space-y-1.5">
+                    <p className="text-[10px] font-semibold text-purple-500 uppercase tracking-wider flex items-center gap-1.5">
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+                      </svg>
+                      Vozes AI (alta qualidade)
+                    </p>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {voices.map((voice, idx) => {
+                        if (voice.engine !== "puter") return null;
+                        const isSelected = idx === selectedVoiceIdx;
+                        return (
+                          <button
+                            key={voice.id}
+                            onClick={() => handleVoiceChange(idx)}
+                            className={`px-3 py-2 rounded-lg text-left transition-all duration-150 ${
+                              isSelected
+                                ? "bg-orange-50 border-2 border-orange-400 shadow-sm"
+                                : "bg-stone-50 border-2 border-transparent hover:bg-stone-100"
+                            }`}
+                          >
+                            <p className={`text-[12px] font-semibold ${isSelected ? "text-orange-600" : "text-stone-700"}`}>
+                              {voice.puterVoice}
+                            </p>
+                            <span className={`text-[9px] font-bold uppercase tracking-wider ${QUALITY_COLORS[voice.quality].split(" ")[1]}`}>
+                              {QUALITY_LABELS[voice.quality]}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Browser voices */}
+                {voices.some((v) => v.engine === "browser") && (
+                  <div className="space-y-1.5">
+                    <p className="text-[10px] font-semibold text-stone-400 uppercase tracking-wider">
+                      Vozes do navegador
+                    </p>
+                    <select
+                      value={selectedVoiceIdx}
+                      onChange={(e) => handleVoiceChange(Number(e.target.value))}
+                      className="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-[12px] text-stone-600 focus:outline-none focus:ring-2 focus:ring-orange-200 focus:border-orange-300 transition-all"
+                    >
+                      {voices.map((voice, idx) => {
+                        if (voice.engine !== "browser") return null;
+                        return (
+                          <option key={voice.id} value={idx}>
+                            {voice.name}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {puterLoading && (
+              <div className="flex items-center gap-2 text-[11px] text-stone-400">
+                <div className="w-3 h-3 border-2 border-orange-200 border-t-orange-500 rounded-full animate-spin" />
+                Carregando vozes AI...
               </div>
             )}
           </div>
@@ -360,27 +426,22 @@ export function AudioPlayer({
   );
 }
 
-/** Reusable small control button */
 function ControlButton({
   onClick,
   title,
   children,
-  size = "sm",
   active = false,
 }: {
   onClick: () => void;
   title: string;
   children: React.ReactNode;
-  size?: "sm" | "md";
   active?: boolean;
 }) {
   return (
     <button
       onClick={onClick}
       title={title}
-      className={`rounded-full flex items-center justify-center transition-all duration-150 active:scale-90 ${
-        size === "sm" ? "w-9 h-9" : "w-11 h-11"
-      } ${
+      className={`w-9 h-9 rounded-full flex items-center justify-center transition-all duration-150 active:scale-90 ${
         active
           ? "text-orange-500 bg-orange-50"
           : "text-stone-400 hover:text-stone-700 hover:bg-stone-50"
